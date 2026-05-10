@@ -159,6 +159,97 @@ async def run_app(conn: EndscopeConnection, buffer_size: int) -> None:
 
         cv2.namedWindow(win_name, flags=cv2.WINDOW_GUI_NORMAL)
 
+        # =====================================================================
+        # DIAG EXPERIMENT: window-close detection on macOS Cocoa backend
+        # ---------------------------------------------------------------------
+        # Context:
+        #   - PR #5 merged. Maintainer added `WND_PROP_AUTOSIZE == -1` clause
+        #     to close-check to fix Wayland. On macOS that clause fires from
+        #     frame one, so the tool quits immediately at startup.
+        #   - Previous experiment: setWindowProperty(AUTOSIZE, 0) silently
+        #     fails on macOS (value stays -1). So AUTOSIZE is unusable as a
+        #     close signal on macOS.
+        #   - Current fallback would be `VISIBLE == 0`, but preliminary
+        #     observation suggests that trips on *minimize* too, not only on
+        #     close. If so, neither upstream clause reliably distinguishes
+        #     close from minimize on macOS.
+        #
+        # Goal of this experiment:
+        #   Find a per-frame property signature that uniquely identifies
+        #   "user closed the window" (red X) and does NOT fire on minimize,
+        #   restore, focus change, or help-window toggle.
+        #
+        # The script walks through a scripted action matrix. Steps advance on
+        # SPACE. Each DIAG event is tagged with the current step number.
+        # =====================================================================
+
+        # The scripted steps. Each entry: (short label, user instruction).
+        _exp_steps = [
+            ("BASELINE",
+             "Window should be visible at default size. Observe the first "
+             "DIAG event, then focus the preview window and press SPACE."),
+            ("MINIMIZE",
+             "Minimize the window (macOS: yellow button; Windows: underscore "
+             "button). Then restore it and press SPACE with the window focused."),
+            ("ALT_TAB_AWAY",
+             "Switch focus AWAY from the window (macOS: Cmd-Tab; Windows: "
+             "Alt-Tab). Then switch back and press SPACE."),
+            ("CLOSE_X",
+             "Click the CLOSE button on the window (macOS: red; Windows: X). "
+             "NOTE macOS: observed greyed-out / disabled — record if so and "
+             "press 'q' to exit. Windows: expect the window to go away; if the "
+             "loop survives, press 'q'."),
+        ]
+
+        # Findings recorded from 2026-05-10 macOS run (Python 3.12, opencv pip):
+        #   post-namedWindow: {'VISIBLE': 1.0, 'AUTOSIZE': -1.0,
+        #                      'FULLSCREEN': 0.0, 'ASPECT_RATIO': -1.0,
+        #                      'OPENGL': -1.0, 'TOPMOST': 0.0}
+        #   setWindowProperty(AUTOSIZE, 0): silently ignored, stays -1.
+        #   MINIMIZE: VISIBLE goes 1->0 while hidden, 0->1 on restore.
+        #   ALT_TAB_AWAY: no property change (focus != visibility).
+        #   CLOSE_X: red button greyed out; no close path from window chrome.
+        #   Conclusion for macOS: only 'q'/Esc work; VISIBLE==0 unreliable
+        #   (same value for minimize), AUTOSIZE==-1 fires from frame one.
+        # Goal on Windows: fill in the same rows and decide whether the
+        # upstream VISIBLE==0 / AUTOSIZE==-1 clauses fire on CLOSE_X without
+        # also firing on MINIMIZE.
+
+        def _print_banner():
+            print("\n" + "=" * 72)
+            print("DIAG EXPERIMENT: window-close detection on macOS")
+            print("Advance through steps by pressing SPACE with the preview "
+                  "window focused.")
+            print("All steps:")
+            for i, (label, instr) in enumerate(_exp_steps, 1):
+                print(f"  {i}. {label}: {instr}")
+            print("=" * 72 + "\n")
+
+        _print_banner()
+
+        # DIAG: one-shot probe of properties right after namedWindow
+        _probes = [
+            ("VISIBLE", cv2.WND_PROP_VISIBLE),
+            ("AUTOSIZE", cv2.WND_PROP_AUTOSIZE),
+            ("FULLSCREEN", cv2.WND_PROP_FULLSCREEN),
+            ("ASPECT_RATIO", cv2.WND_PROP_ASPECT_RATIO),
+            ("OPENGL", cv2.WND_PROP_OPENGL),
+            ("TOPMOST", cv2.WND_PROP_TOPMOST),
+        ]
+        print("DIAG post-namedWindow:", {
+            name: cv2.getWindowProperty(win_name, prop) for name, prop in _probes
+        })
+        # Try to initialize AUTOSIZE to 0 — prior experiment showed this is a
+        # no-op on macOS Cocoa, but recording the before/after leaves a clear
+        # audit trail in the log.
+        try:
+            cv2.setWindowProperty(win_name, cv2.WND_PROP_AUTOSIZE, 0)
+            _after = cv2.getWindowProperty(win_name, cv2.WND_PROP_AUTOSIZE)
+            print(f"DIAG after setWindowProperty(AUTOSIZE, 0) AUTOSIZE={_after} "
+                  f"(expected 0 if set honored, -1 if ignored)")
+        except cv2.error as e:
+            print(f"DIAG setWindowProperty raised: {e}")
+
         # Build help image once
         help_lines = [
             "Keyboard shortcuts:",
@@ -208,6 +299,20 @@ async def run_app(conn: EndscopeConnection, buffer_size: int) -> None:
 
         rotation_lock = False
         rotation = 0
+
+        # DIAG: experiment state. _exp_idx points into _exp_steps.
+        _diag_last = None
+        _diag_event = 0
+        _exp_idx = 0
+
+        def _announce_step():
+            label, instr = _exp_steps[_exp_idx]
+            banner = f">>> STEP {_exp_idx + 1}/{len(_exp_steps)} — {label} <<<"
+            print("\n" + banner)
+            print(instr)
+            print("(SPACE = advance to next step, q = quit)\n")
+
+        _announce_step()
         fullframe = False
 
         raw_frame = 0
@@ -400,6 +505,32 @@ async def run_app(conn: EndscopeConnection, buffer_size: int) -> None:
                     # we do this only when a frame is completely evaluated to save CPU!
                     key = cv2.pollKey() & 0xFF
 
+                    # DIAG: read ALL probed window properties each frame; print
+                    # only when the tuple changes. Each event is tagged with
+                    # the current experiment step so cause and effect line up.
+                    _vals = tuple(
+                        cv2.getWindowProperty(win_name, p) for _, p in _probes
+                    )
+                    if _vals != _diag_last:
+                        _diag_event += 1
+                        _step_label = _exp_steps[_exp_idx][0]
+                        print(
+                            f"DIAG event#{_diag_event} [step {_exp_idx + 1} "
+                            f"{_step_label}]: "
+                            + ", ".join(
+                                f"{name}={v}" for (name, _), v in zip(_probes, _vals)
+                            )
+                        )
+                        _diag_last = _vals
+
+                    # DIAG: SPACE advances to the next experiment step.
+                    if key == ord(" "):
+                        if _exp_idx + 1 < len(_exp_steps):
+                            _exp_idx += 1
+                            _announce_step()
+                        else:
+                            print("DIAG: final step reached. Press q to quit.")
+
                     # Toggle help window on mouse click
                     if mouse_clicked[0]:
                         mouse_clicked[0] = False
@@ -429,8 +560,13 @@ async def run_app(conn: EndscopeConnection, buffer_size: int) -> None:
                     elif (
                         key == ord("q")
                         or key == 27
-                        or cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) == 0
-                        or cv2.getWindowProperty(win_name, cv2.WND_PROP_AUTOSIZE) == -1
+                        # DIAG EXPERIMENT: both upstream close-clauses disabled
+                        # so the loop survives minimize/restore. Exit with 'q'
+                        # or Esc. After running the action matrix (including
+                        # red-X close, which will leave the window destroyed
+                        # but the loop alive), press 'q' to stop cleanly.
+                        # or cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) == 0
+                        # or cv2.getWindowProperty(win_name, cv2.WND_PROP_AUTOSIZE) == -1
                     ):
                         print("window closed")
                         break
