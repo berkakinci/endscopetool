@@ -143,6 +143,20 @@ elif sys.platform.startswith("linux") and (
 - Does Wayland's MINIMIZE trip `VISIBLE == 0` too? If so, the Linux
   branch has the same false-positive problem as macOS and needs a
   different predicate (or accepts that minimize = close).
+
+## Addendum (2026-05-16): Proposed fix superseded
+
+The platform-gated approach above is wrong for GTK.  Source inspection
+(see "Follow-up" section below) revealed:
+
+- `VISIBLE` is always -1 on GTK (unimplemented) — `== 0` never fires.
+- `AUTOSIZE == -1` works only as a "window not found" sentinel, not a
+  property change.
+- `getWindowImageRect` raises reliably on both GTK and Windows after close.
+
+The actual fix is simpler: call `_is_window_closed()` (which uses
+`getWindowImageRect`) **before** `imshow`, since `imshow` silently recreates
+destroyed windows on GTK.  No platform-gating needed.
 - Would the maintainer accept `sys.platform`-gated clauses, or prefer
   a different structure (e.g., a single `is_window_closed(name)`
   helper)?
@@ -175,3 +189,72 @@ Supporting facts that justify dropping `AUTOSIZE` from the check:
 - On Wayland / Hyprland its `== -1` value post-destroy is coincidental — `VISIBLE < 0` catches the same condition.
 
 Rabbit-hole note: most of the matrix-based investigation was unnecessary. Once we asked "why not wait for a raise on destroy," the `try/except` + `VISIBLE < 0` predicate fell out immediately. The experiment was still worthwhile for producing the evidence table and for invalidating the maintainer's `AUTOSIZE == -1` hypothesis as a *designed* signal.
+
+---
+
+## Follow-up: Source code inspection (2026-05-16)
+
+Maintainer reported window re-opens on close (Hyprland/GTK3).  Inspected
+OpenCV 4.x HighGUI source to confirm behavior.
+
+Source refs (all `4.x` branch, stable across 4.10–4.12+):
+- [window_gtk.cpp](https://github.com/opencv/opencv/blob/4.x/modules/highgui/src/window_gtk.cpp)
+- [window_wayland.cpp](https://github.com/opencv/opencv/blob/4.x/modules/highgui/src/window_wayland.cpp)
+- [window.cpp](https://github.com/opencv/opencv/blob/4.x/modules/highgui/src/window.cpp) (legacy C-API dispatcher)
+
+### Findings
+
+**VISIBLE on GTK: hard-coded -1 (unimplemented).**
+[`window.cpp` WND_PROP_VISIBLE case](https://github.com/opencv/opencv/blob/4.x/modules/highgui/src/window.cpp):
+GTK is not listed among QT/Win32/Cocoa — falls to `#else return -1`.
+The maintainer's "VISIBLE is always -1 on Wayland" is really "always -1 on GTK,
+any display server."
+
+**AUTOSIZE on GTK: returns -1 when window not found.**
+[`cvGetPropWindowAutoSize_GTK`](https://github.com/opencv/opencv/blob/4.x/modules/highgui/src/window_gtk.cpp)
+does `icvFindWindowByName` → if null, `return -1`.  This is why the
+maintainer's `AUTOSIZE == -1` check worked — it's a "not found" sentinel.
+
+**getWindowImageRect on GTK: raises when window not found.**
+[`cvGetWindowRect_GTK`](https://github.com/opencv/opencv/blob/4.x/modules/highgui/src/window_gtk.cpp)
+does `icvFindWindowByName` → if null, `CV_Error("NULL window")`.  Same as
+Windows (raises after destroy).
+
+**imshow on GTK: recreates destroyed windows.**
+[`cvShowImage`](https://github.com/opencv/opencv/blob/4.x/modules/highgui/src/window_gtk.cpp)
+does `icvFindWindowByName` → if null, calls `cvNamedWindow` to recreate.
+This is the root cause of the re-open bug.
+
+**icvOnClose on GTK: removes window from internal list.**
+[`icvOnClose`](https://github.com/opencv/opencv/blob/4.x/modules/highgui/src/window_gtk.cpp)
+→ `icvDeleteWindow_` → erases from `g_windows`.
+
+**Native Wayland backend: close is a no-op.**
+[`handle_toplevel_close`](https://github.com/opencv/opencv/blob/4.x/modules/highgui/src/window_wayland.cpp)
+is `CV_UNUSED(data); CV_UNUSED(surface);` — window stays alive.  Irrelevant
+for the maintainer (uses GTK3 via `enableGtk3 = true`).
+
+### Revised table
+
+| Call | GTK alive | GTK after close | Windows alive | Windows after close | macOS |
+|---|---|---|---|---|---|
+| `getWindowProperty(VISIBLE)` | -1 (always) | -1 (always) | 1.0 | raises | 1.0 / 0.0 on minimize |
+| `getWindowProperty(AUTOSIZE)` | 0 (NORMAL) | -1 (not found) | 0.0 | raises | -1 (always) |
+| `getWindowImageRect` | returns rect | **raises** | returns rect | **raises** | returns rect / N/A |
+| `imshow` | shows image | **recreates** | shows image | **recreates** | shows image |
+
+### Why the try/except didn't catch it
+
+The first cv2 call each iteration is `imshow`, which doesn't raise — it
+recreates.  By the time anything else runs, the window is alive again.
+
+### Fix
+
+Check `_is_window_closed()` before `imshow`.  `getWindowImageRect` raises while
+the window is still absent → helper returns True → break before recreation.
+
+### Note on _is_window_closed stanzas
+
+- Stanza 1 (`getWindowImageRect` raise): does the actual work on Windows + GTK.
+- Stanza 2 (`VISIBLE < 0`): dead code in practice (stanza 1 fires first on
+  both platforms; on macOS close is unreachable).  Kept as defensive fallback.
